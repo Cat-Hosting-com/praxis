@@ -18,7 +18,7 @@ jobs:
     name: Rebuild patched images
     uses: ./.github/workflows/arm64-images.yml
     with:
-      ref: v1.0.1
+      version: "1.0.1"
     secrets: inherit
 
   security:

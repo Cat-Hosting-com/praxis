@@ -45,7 +45,12 @@ python-multipart==0.0.32
 psycopg2-binary==2.9.12
 python-dotenv==1.2.2
 slowapi==0.1.10
-pyjwt==2.13.0
+# CVE-2026-102268: an authentication bypass in public-key verification,
+# fixed in 2.14.0. OIDC still verifies RS256 tokens with an explicit algorithm.
+pyjwt==2.14.0
+# GHSA-6q48-6c7w-9gw2 is in the certifi release pip otherwise resolves.
+# Pin it so the image scan cannot drift back to 2026.6.17.
+certifi==2026.10.18
 hvac==2.4.0
 paramiko==5.0.0
 psutil==5.9.8

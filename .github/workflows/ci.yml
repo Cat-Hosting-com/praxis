@@ -430,7 +430,10 @@ jobs:
     # The gap for unmatched branches and forks is deliberate: closing it would
     # mean granting the upload credential to untrusted pull request events. It
     # is a known reporting limitation for as long as coverage gates stay off.
-    if: github.event_name == 'push'
+    # DeepSource only has a project for the upstream repository. A push on
+    # this fork still receives an OIDC token, and the uploader then fails
+    # with 401 because there is no project to file the report against.
+    if: github.event_name == 'push' && github.repository == 'cytechlabs/praxis'
     permissions:
       contents: read
       # The uploader trades this token for a short-lived credential, so no
