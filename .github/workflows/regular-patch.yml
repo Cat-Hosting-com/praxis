@@ -1,0 +1,30 @@
+name: Regular patch
+
+on:
+  schedule:
+    - cron: "15 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: regular-patch
+  cancel-in-progress: false
+
+jobs:
+  images:
+    name: Rebuild patched images
+    uses: ./.github/workflows/arm64-images.yml
+    with:
+      ref: v1.0.1
+    secrets: inherit
+
+  security:
+    name: Scan patched images
+    needs: images
+    uses: ./.github/workflows/image-security.yml
+    with:
+      version: "1.0.1"
+    secrets: inherit

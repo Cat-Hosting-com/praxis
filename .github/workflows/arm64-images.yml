@@ -1,0 +1,159 @@
+name: Arm64 images
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        type: string
+        default: v1.0.1
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        default: v1.0.1
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: arm64-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve image names
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      owner: ${{ steps.meta.outputs.owner }}
+      date: ${{ steps.meta.outputs.date }}
+    steps:
+      - name: Resolve ref, version, and owner
+        id: meta
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-v1.0.1}"
+          version="${ref#v}"
+          version="$(printf '%s' "$version" | tr '/_' '--')"
+          owner="$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          date="$(date -u +%Y%m%d)"
+          {
+            echo "ref=$ref"
+            echo "version=$version"
+            echo "owner=$owner"
+            echo "date=$date"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the requested ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            PRAXIS_EE=0
+          tags: ghcr.io/${{ needs.prepare.outputs.owner }}/praxis-backend:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ./frontend-next
+          file: ./frontend-next/Dockerfile.prod
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/${{ needs.prepare.outputs.owner }}/praxis-frontend:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+  manifest:
+    name: Publish multi-arch tags
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifests
+        env:
+          OWNER: ${{ needs.prepare.outputs.owner }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DATE: ${{ needs.prepare.outputs.date }}
+        run: |
+          set -euo pipefail
+          for image in praxis-backend praxis-frontend; do
+            docker buildx imagetools create \
+              --tag "ghcr.io/${OWNER}/${image}:${VERSION}" \
+              --tag "ghcr.io/${OWNER}/${image}:${VERSION}-patched-${DATE}" \
+              "ghcr.io/${OWNER}/${image}:${VERSION}-amd64" \
+              "ghcr.io/${OWNER}/${image}:${VERSION}-arm64"
+          done
+
+      - name: Make the packages public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          for image in praxis-backend praxis-frontend; do
+            gh api --method PUT "/orgs/${ORG}/packages/container/${image}" \
+              -f visibility=public \
+              || echo "Could not change visibility of ${image}. Set the package to public in the org package settings."
+          done

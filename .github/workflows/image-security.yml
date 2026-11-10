@@ -1,0 +1,68 @@
+name: Image security
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Image version without a leading v
+        required: false
+        type: string
+        default: "1.0.1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Image version without a leading v
+        required: false
+        default: "1.0.1"
+        type: string
+  schedule:
+    - cron: "30 5 * * *"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  scan:
+    name: Scan ${{ matrix.image }} ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [praxis-backend, praxis-frontend]
+        arch: [amd64, arm64]
+    steps:
+      - name: Resolve image
+        id: image
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-1.0.1}"
+          owner="$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${owner}/${IMAGE}:${version}-${ARCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Report high and critical findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: false
+          vuln-type: os,library
+
+      - name: Fail on unfixed critical findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library

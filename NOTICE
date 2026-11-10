@@ -14,3 +14,7 @@ available at:
 This software depends on third-party open-source components, each distributed
 under its own license. Those licenses continue to apply to their respective
 components.
+
+Cat-Hosting.com publishes separate linux/amd64 and linux/arm64 container
+images built from this fork. Those images are not CytechLabs releases. The
+Praxis name is used only to identify the upstream work.
