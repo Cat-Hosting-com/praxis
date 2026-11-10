@@ -94,8 +94,14 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
 
 # The slim base image ships its own certifi for the system pip. The app uses
 # the venv pin (GHSA-6q48-6c7w-9gw2, fixed in 2026.10.18). Upgrade this unused
-# copy with the base interpreter so the image scan does not keep 2026.6.17.
-RUN /usr/local/bin/python -m pip install --no-cache-dir "certifi==2026.10.18"
+# copy with the base interpreter. pip and ensurepip also vendor 2026.6.17
+# under pip/_vendor, which the image scan still reports. The runtime never
+# calls pip, so remove those copies after the upgrade.
+RUN /usr/local/bin/python -m pip install --no-cache-dir "certifi==2026.10.18" \
+ && rm -rf /usr/local/lib/python3.14/site-packages/pip \
+           /usr/local/lib/python3.14/site-packages/pip-*.dist-info \
+           /usr/local/lib/python3.14/ensurepip \
+           /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.14
 
 # Non-root user (UID 1000).
 RUN groupadd --system --gid 1000 praxis \
@@ -118,6 +124,11 @@ RUN if [ -e /app/scripts/spikes ]; then \
         echo "ERROR: /app/scripts/spikes must not be present in the runtime image" >&2 ; \
         exit 1 ; \
     fi
+
+# The copied venv includes pip, which vendors the same unfixed certifi.
+RUN rm -rf /opt/venv/lib/python3.14/site-packages/pip \
+           /opt/venv/lib/python3.14/site-packages/pip-*.dist-info \
+           /opt/venv/bin/pip /opt/venv/bin/pip3 /opt/venv/bin/pip3.14
 
 RUN chmod +x /app/scripts/start.prod.sh && chown -R praxis:praxis /app
 
