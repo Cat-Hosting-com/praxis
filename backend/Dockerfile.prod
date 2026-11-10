@@ -92,6 +92,11 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
         apt-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# The slim base image ships its own certifi for the system pip. The app uses
+# the venv pin (GHSA-6q48-6c7w-9gw2, fixed in 2026.10.18). Upgrade this unused
+# copy with the base interpreter so the image scan does not keep 2026.6.17.
+RUN /usr/local/bin/python -m pip install --no-cache-dir "certifi==2026.10.18"
+
 # Non-root user (UID 1000).
 RUN groupadd --system --gid 1000 praxis \
  && useradd  --system --uid 1000 --gid praxis --home-dir /app --shell /sbin/nologin praxis
