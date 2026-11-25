@@ -75,7 +75,10 @@ class AgentTransport(Transport):
             raise _broker_error_to_transport(exc) from exc
 
         if result.outcome != "success":
-            reason = (result.error or {}).get("reason", "agent_error")
+            err = result.error or {}
+            reason = err.get("reason", "agent_error")
+            if reason in _REVOKED_REASONS:
+                raise TransportError(_interrupted_message(reason, err))
             raise TransportError(f"agent: exec returned {result.outcome}/{reason}")
 
         return CommandResult(
@@ -229,6 +232,8 @@ class AgentTransport(Transport):
 # full detail is logged server-side only.
 _REASON_MESSAGES = {
     "transport_unavailable": "agent transport is unavailable",
+    "agent_not_active": "agent is disabled or revoked; command not sent",
+    "identity_unverifiable": "agent identity could not be verified; command not sent",
     "broker_unreachable": "agent broker is unreachable",
     "agent_attach_timeout": "agent did not attach in time",
     "header_timeout": "agent did not send a file header in time",
@@ -237,7 +242,35 @@ _REASON_MESSAGES = {
     "op_stream_closed": "agent transfer stream closed early",
     "broker_busy": "agent broker is at capacity; retry shortly",
     "too_large": "transfer exceeded the size limit",
+    "not_found": "file not found on the host",
+    "denied": "permission denied on the host",
+    "is_directory": "path is a directory",
+    "not_regular": "path is not a regular file",
+    "read_failed": "the host could not read the file",
 }
+
+
+_REVOKED_REASONS = frozenset({"agent_revoked", "agent_revoked_unconfirmed"})
+
+
+def _interrupted_message(reason: str, err: dict) -> str:
+    """Caller-visible text for a command interrupted because the agent was
+    disabled or revoked. States what is known about the process and never
+    implies that effects already produced were undone."""
+    termination = err.get("termination") or "unconfirmed"
+    if termination == "confirmed":
+        known = "the command's process group was stopped and verified gone"
+    elif termination == "not_started":
+        known = "the command had not started"
+    else:
+        known = (
+            "the command was interrupted but it could not be confirmed that its "
+            "process stopped"
+        )
+    return (
+        f"agent: agent disabled or revoked during the operation; {known}; "
+        f"changes already made on the host are not undone ({reason})"
+    )
 
 
 def _broker_error_to_transport(exc: BrokerError) -> TransportError:
@@ -255,6 +288,12 @@ def _broker_error_to_transport(exc: BrokerError) -> TransportError:
         )
     message = _REASON_MESSAGES.get(reason, "agent transport error")
     text = f"agent: {message} ({reason})"
-    if reason == "transport_unavailable":
-        return TransportUnavailable(text)
-    return TransportError(text)
+    error: TransportError
+    if reason in ("transport_unavailable", "agent_not_active", "identity_unverifiable"):
+        error = TransportUnavailable(text)
+    else:
+        error = TransportError(text)
+    # Callers that must tell a missing file from a dead tunnel key off this
+    # instead of parsing the message.
+    error.reason = reason  # type: ignore[attr-defined]
+    return error

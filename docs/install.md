@@ -38,7 +38,7 @@ Compose files change between releases, so a checkout that does not match the
 images can start a stack the release was never tested as:
 
 ```sh
-git checkout v1.0.0
+git checkout v1.0.2
 ```
 
 On the source path, stay on the branch you are working on.
@@ -61,7 +61,7 @@ At minimum, set:
 | `PUBLIC_BASE_URL` | The external URL browsers use, for example `https://praxis.example.com`. Redirect flows and single sign-on depend on it. |
 | `PRAXIS_DOMAIN` | The hostname Caddy answers on. |
 | `PRAXIS_TLS_MODE` | `internal`, `acme`, or `byo`. See TLS below. |
-| `PRAXIS_VERSION` | The release to run, for example `1.0.0`. Pin it; do not run `latest` in production. A source build overrides the image, so this only labels what you built. |
+| `PRAXIS_VERSION` | The release to run, for example `1.0.2`. Pin it; do not run `latest` in production. A source build overrides the image, so this only labels what you built. |
 
 Keep `.env` out of version control and readable only by the account that runs
 the stack. `ENVIRONMENT=production` enables the startup hardening checks; do not

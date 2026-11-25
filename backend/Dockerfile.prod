@@ -8,7 +8,7 @@
 # that held it is fixed in PRA-320's backend/app/broker/tls.py). The only web-stack pin
 # change this required was pydantic 2.6.0 -> 2.12.0 (first line whose pydantic-core has a
 # cp314 wheel); every dependency installs from a wheel on 3.14 (no source builds).
-FROM python:3.14.7-slim-bookworm AS builder
+FROM python:3.14.10-slim-bookworm AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -65,7 +65,7 @@ RUN if [ "$PRAXIS_EE" = "1" ]; then \
 # ── Runtime ──────────────────────────────────────────────────────────────
 # PRA-319: keep the runtime base pinned to the SAME Python as the builder so the
 # copied /opt/venv (with its compiled cp314 extension modules) matches the interpreter.
-FROM python:3.14.7-slim-bookworm AS runtime
+FROM python:3.14.10-slim-bookworm AS runtime
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -92,17 +92,6 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
         apt-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# The slim base image ships its own certifi for the system pip. The app uses
-# the venv pin (GHSA-6q48-6c7w-9gw2, fixed in 2026.10.18). Upgrade this unused
-# copy with the base interpreter. pip and ensurepip also vendor 2026.6.17
-# under pip/_vendor, which the image scan still reports. The runtime never
-# calls pip, so remove those copies after the upgrade.
-RUN /usr/local/bin/python -m pip install --no-cache-dir "certifi==2026.10.18" \
- && rm -rf /usr/local/lib/python3.14/site-packages/pip \
-           /usr/local/lib/python3.14/site-packages/pip-*.dist-info \
-           /usr/local/lib/python3.14/ensurepip \
-           /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.14
-
 # Non-root user (UID 1000).
 RUN groupadd --system --gid 1000 praxis \
  && useradd  --system --uid 1000 --gid praxis --home-dir /app --shell /sbin/nologin praxis
@@ -110,6 +99,18 @@ RUN groupadd --system --gid 1000 praxis \
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
+
+# The runtime image never installs packages, so drop the installer from both
+# interpreters (the venv copy and the base image's own). pip bundles private
+# copies of certifi, msgpack, urllib3 and pkg_resources that no application code
+# imports but that vulnerability scanners report as shipped components. All
+# installation happens in the builder stage.
+RUN /opt/venv/bin/python -m pip uninstall -y pip \
+ && /usr/local/bin/python -m pip uninstall -y pip \
+ && ! /opt/venv/bin/python -c "import pip" 2>/dev/null \
+ && ! /usr/local/bin/python -c "import pip" 2>/dev/null \
+ && ! find /usr/local /opt/venv -type d -path "*/pip/_vendor" | grep -q .
+
 COPY --from=builder /build/app /app/app
 COPY --from=builder /build/alembic.ini /app/
 COPY --from=builder /build/alembic /app/alembic
@@ -124,11 +125,6 @@ RUN if [ -e /app/scripts/spikes ]; then \
         echo "ERROR: /app/scripts/spikes must not be present in the runtime image" >&2 ; \
         exit 1 ; \
     fi
-
-# The copied venv includes pip, which vendors the same unfixed certifi.
-RUN rm -rf /opt/venv/lib/python3.14/site-packages/pip \
-           /opt/venv/lib/python3.14/site-packages/pip-*.dist-info \
-           /opt/venv/bin/pip /opt/venv/bin/pip3 /opt/venv/bin/pip3.14
 
 RUN chmod +x /app/scripts/start.prod.sh && chown -R praxis:praxis /app
 

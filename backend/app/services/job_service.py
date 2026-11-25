@@ -61,8 +61,8 @@ _running_jobs: Dict[int, Dict[str, Any]] = {}  # job_id -> {"cancelled": Event}
 _running_jobs_lock = threading.Lock()
 
 # Scheduled-run maintenance-window policy by job type. Only read/refresh jobs
-# (package_scan/audit — they SSH-read inventory and never mutate a host) may run
-# outside a window; everything else is window-governed. This is an explicit
+# may run outside a window: package scans can refresh APT metadata, while
+# inventory audits use cached lists. Other jobs stay window-governed. This is an explicit
 # allowlist so an unknown/future job type FAILS CLOSED (stays window-governed).
 _READ_REFRESH_JOB_TYPES = frozenset({"package_scan", "audit"})
 
@@ -1120,7 +1120,9 @@ class JobService:
                 job_history_id=history_id,
             )
         elif job_type == "audit":
-            return pkg_service.scan_packages(system.id)
+            # An audit reads inventory only; it never refreshes upstream
+            # metadata, so a scheduled audit cannot run a privileged apt update.
+            return pkg_service.scan_packages(system.id, refresh=False)
         else:
             raise ValueError(f"Unsupported job type: {job_type}")
 
@@ -1151,7 +1153,7 @@ class JobService:
                 "hostname": system.hostname,
             }
 
-            if job.job_type == "package_scan" or job.job_type == "audit":
+            if job.job_type in ("package_scan", "audit"):
                 pkg_count = (
                     self.db.query(Package)
                     .filter(Package.system_id == system.id)
@@ -1531,10 +1533,13 @@ class JobService:
         visited = set()
 
         for job in all_jobs:
-            if job.id in dep_ids and job.depends_on_job_id is None:
-                if job.id not in visited:
-                    chain = self._build_chain(job, all_jobs, visited)
-                    chains.append(chain)
+            if (
+                job.id in dep_ids
+                and job.depends_on_job_id is None
+                and job.id not in visited
+            ):
+                chain = self._build_chain(job, all_jobs, visited)
+                chains.append(chain)
 
         # Also include orphan dependents (parent deleted)
         for job in all_jobs:

@@ -11,8 +11,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -64,34 +66,19 @@ func (p *opPump) runExec(ctx context.Context, opID int, conn *websocket.Conn, ra
 		defer cancelTimeout()
 	}
 
-	cmd := exec.CommandContext(execCtx, ep.cmd, ep.args...)
-	cmd.Env = ep.env
-	if ep.cwd != "" {
-		cmd.Dir = ep.cwd
+	// Cancelled before anything was started: there is no process to stop.
+	if ctx.Err() != nil {
+		return opOutcomeCancelledWith(terminationNotStarted)
 	}
-	// New process group so we can SIGKILL the whole tree on cancel.
-	// Without this, the child's children outlive the op.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	stdin, err := cmd.StdinPipe()
+	cmd, stdin, stdout, stderr, err := newExecCmd(execCtx, ep)
 	if err != nil {
-		return opOutcomeError("spawn_failed")
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return opOutcomeError("spawn_failed")
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
 		return opOutcomeError("spawn_failed")
 	}
 	// Backstop closers: we may need to forcibly close the pipe read
 	// ends after the drain timeout to unblock pumpPipe goroutines
 	// stuck in a blocking syscall on the underlying fd. Context
-	// cancellation does NOT unblock kernel pipe reads — only closing
+	// cancellation does NOT unblock kernel pipe reads, only closing
 	// the fd does. Wait() closes the WRITE end internally, but if a
 	// grandchild was reparented (e.g. setsid) and still holds its own
 	// write fd, our read end stays open until we close it ourselves.
@@ -164,7 +151,7 @@ func (p *opPump) runExec(ctx context.Context, opID int, conn *websocket.Conn, ra
 	// Wait for both pumps to return (pipe EOF after child closes its
 	// write ends), then call cmd.Wait to reap. If the bridge context
 	// is cancelled (op_cancel, timeout, inbound protocol error), the
-	// process is killed via execCtx → exec.CommandContext, slave
+	// process is killed via execCtx -> exec.CommandContext, slave
 	// pipes close, pumps exit naturally.
 	pumpsDone := make(chan struct{})
 	go func() {
@@ -172,22 +159,7 @@ func (p *opPump) runExec(ctx context.Context, opID int, conn *websocket.Conn, ra
 		<-stderrDone
 		close(pumpsDone)
 	}()
-	// Normal path: wait indefinitely for pumps to drain via natural
-	// pipe EOF after the child exits.
-	// Cancel/timeout path: bridgeCtx fires; give pumps a short window
-	// to drain whatever's left, then force the read ends closed so a
-	// grandchild holding a write fd can't stall us forever.
-	select {
-	case <-pumpsDone:
-	case <-bridgeCtx.Done():
-		select {
-		case <-pumpsDone:
-		case <-time.After(drainAfterKill):
-			_ = stdoutCloser.Close()
-			_ = stderrCloser.Close()
-			<-pumpsDone
-		}
-	}
+	awaitPumps(bridgeCtx, pumpsDone, stdoutCloser, stderrCloser)
 
 	waitErr := cmd.Wait()
 	// Kill stragglers (grandchildren in the process group).
@@ -214,17 +186,76 @@ func (p *opPump) runExec(ctx context.Context, opID int, conn *websocket.Conn, ra
 	defer cancelClose()
 	_ = closeWSSGracefully(closeCtx, conn)
 
-	// Outcome resolution:
-	//   - parent ctx cancelled (user op_cancel) → cancelled.
-	//     runOp's caller-level check also enforces this; we set it
-	//     here so the exit_code field stays nil.
-	//   - timeout fired → error/timeout.
-	//   - inbound protocol error → error/<reason>.
-	//   - normal exit (zero or not) → success/<exit_code>.
+	mu.Lock()
+	protoErr := inboundErr
+	mu.Unlock()
+	return execOutcome(ctx, execCtx, ep.timeout, protoErr, waitErr, pgid)
+}
+
+// newExecCmd builds the command in its own process group (so cancel can kill
+// the whole tree) with its three pipes. On error nothing is left open.
+func newExecCmd(
+	execCtx context.Context, ep execParams,
+) (cmd *exec.Cmd, stdin io.WriteCloser, stdout, stderr io.ReadCloser, err error) {
+	cmd = exec.CommandContext(execCtx, ep.cmd, ep.args...)
+	cmd.Env = ep.env
+	if ep.cwd != "" {
+		cmd.Dir = ep.cwd
+	}
+	// New process group so we can SIGKILL the whole tree on cancel.
+	// Without this, the child's children outlive the op.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if stdin, err = cmd.StdinPipe(); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if stdout, err = cmd.StdoutPipe(); err != nil {
+		_ = stdin.Close()
+		return nil, nil, nil, nil, err
+	}
+	if stderr, err = cmd.StderrPipe(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, nil, nil, nil, err
+	}
+	return cmd, stdin, stdout, stderr, nil
+}
+
+// awaitPumps blocks until the output pumps finish. On the normal path that is
+// natural pipe EOF after the child exits. Once bridgeCtx fires (cancel,
+// timeout, inbound error) the pumps get a short window to drain, after which
+// the pipe read ends are closed so a grandchild holding a write fd cannot
+// stall completion.
+func awaitPumps(bridgeCtx context.Context, pumpsDone <-chan struct{}, closers ...io.Closer) {
+	select {
+	case <-pumpsDone:
+	case <-bridgeCtx.Done():
+		select {
+		case <-pumpsDone:
+		case <-time.After(drainAfterKill):
+			for _, c := range closers {
+				_ = c.Close()
+			}
+			<-pumpsDone
+		}
+	}
+}
+
+// execOutcome resolves what op_complete reports once the process is reaped:
+//   - parent ctx cancelled (user op_cancel) -> cancelled, with the process
+//     group's verified termination state; exit_code stays nil.
+//   - timeout fired -> error/timeout.
+//   - inbound protocol error -> error/<reason>.
+//   - normal exit (zero or not) -> success/<exit_code>.
+func execOutcome(
+	ctx, execCtx context.Context, timeout time.Duration, inboundErr, waitErr error, pgid int,
+) opOutcome {
 	switch {
 	case errors.Is(ctx.Err(), context.Canceled):
-		return opOutcomeCancelled()
-	case ep.timeout > 0 && errors.Is(execCtx.Err(), context.DeadlineExceeded):
+		// The broker cancelled this op. Report whether the process group is
+		// verifiably gone rather than assuming the kill worked.
+		return opOutcomeCancelledWith(verifyGroupStopped(pgid))
+	case timeout > 0 && errors.Is(execCtx.Err(), context.DeadlineExceeded):
 		return opOutcomeError("timeout")
 	case inboundErr != nil:
 		return opOutcomeError(inboundErr.Error())
@@ -232,15 +263,229 @@ func (p *opPump) runExec(ctx context.Context, opID int, conn *websocket.Conn, ra
 	exitCode := 0
 	if waitErr != nil {
 		var ee *exec.ExitError
-		if errors.As(waitErr, &ee) {
-			exitCode = ee.ExitCode()
-		} else {
+		if !errors.As(waitErr, &ee) {
 			// Wait failed for a non-exit reason (e.g. broken pipe to
 			// child setup). Treat as runtime error.
 			return opOutcomeError("spawn_failed")
 		}
+		exitCode = ee.ExitCode()
 	}
 	return opOutcomeSuccessExit(exitCode)
+}
+
+// groupVerifyTimeout bounds how long we poll for the killed process group to
+// disappear before reporting the termination as unconfirmed.
+const groupVerifyTimeout = time.Second
+
+// groupState is what an inspection of a process group could establish.
+type groupState int
+
+const (
+	// groupGone: the group has no live member, with evidence.
+	groupGone groupState = iota
+	// groupLive: at least one live member was seen.
+	groupLive
+	// groupUnknown: the inspection could not account for every possible
+	// member (unreadable or unparseable entries, hidden processes, no
+	// process table), so absence cannot be claimed.
+	groupUnknown
+)
+
+// procInspector reads the process table. The fields are replaceable so the
+// conservative paths can be exercised without privileged setups.
+type procInspector struct {
+	proc fs.FS
+	// probe is kill(-pgid, 0).
+	probe func(pgid int) error
+	// kill is kill(-pgid, SIGKILL).
+	kill func(pgid int) error
+	// hidden reports that this process cannot see every other process.
+	hidden func() bool
+}
+
+func defaultInspector() procInspector {
+	return procInspector{
+		proc:   os.DirFS("/proc"),
+		probe:  func(pgid int) error { return syscall.Kill(-pgid, 0) },
+		kill:   func(pgid int) error { return syscall.Kill(-pgid, syscall.SIGKILL) },
+		hidden: procHidesOtherProcesses,
+	}
+}
+
+// procHidesOtherProcesses is true when /proc is mounted with hidepid and the
+// caller is not root: a scan then silently omits other users' processes.
+func procHidesOtherProcesses() bool {
+	return procHidesFor(os.Geteuid(), func() ([]byte, error) {
+		return os.ReadFile("/proc/self/mounts")
+	})
+}
+
+// procHidesFor decides visibility from the effective uid and the mount table.
+// An unreadable table is treated as hidden: absence of evidence is not safety.
+func procHidesFor(euid int, readMounts func() ([]byte, error)) bool {
+	if euid == 0 {
+		return false
+	}
+	raw, err := readMounts()
+	if err != nil {
+		return true // cannot tell, so assume the worst
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[1] != "/proc" {
+			continue
+		}
+		for _, opt := range strings.Split(f[3], ",") {
+			switch opt {
+			case "hidepid=1", "hidepid=2", "hidepid=invisible", "hidepid=noaccess":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// verifyGroupStopped sends SIGKILL to the process group and polls until the
+// group is verifiably gone, returning terminationConfirmed, or
+// terminationUnconfirmed when members persist past the bound, the group
+// cannot be fully inspected, or the signal could not be delivered and the
+// group was not shown to be gone. Scope: members still in the group. A
+// descendant that moved itself to another session or group is outside both the
+// kill and this check.
+func verifyGroupStopped(pgid int) string {
+	return verifyGroupStoppedWith(pgid, defaultInspector(), groupVerifyTimeout)
+}
+
+func verifyGroupStoppedWith(pgid int, in procInspector, bound time.Duration) string {
+	deadline := time.Now().Add(bound)
+	for {
+		// A failed signal (e.g. EPERM) is not evidence of anything: whether
+		// the group is gone is decided only by the inspection below.
+		_ = in.kill(pgid)
+		if inspectGroup(pgid, in) == groupGone {
+			return terminationConfirmed
+		}
+		if time.Now().After(deadline) {
+			return terminationUnconfirmed
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// inspectGroup reports whether process group pgid still has a live member.
+// Gone is reported only when it is established: kill(-pgid, 0) says no such
+// process, or a complete scan accounts for every entry (live members absent,
+// zombies ignored). Anything unreadable, unparseable, hidden or inconsistent
+// is unknown.
+func inspectGroup(pgid int, in procInspector) groupState {
+	probeErr := in.probe(pgid)
+	if errors.Is(probeErr, syscall.ESRCH) {
+		return groupGone
+	}
+	if errors.Is(probeErr, syscall.EPERM) {
+		return groupLive // members exist that this process may not signal
+	}
+	if in.hidden != nil && in.hidden() {
+		return groupUnknown
+	}
+	entries, err := fs.ReadDir(in.proc, ".")
+	if err != nil {
+		return groupUnknown
+	}
+	want := strconv.Itoa(pgid)
+	unknown := false
+	zombies := 0
+	for _, e := range entries {
+		switch classifyProcEntry(in.proc, e.Name(), want) {
+		case entryLive:
+			return groupLive
+		case entryZombie:
+			zombies++
+		case entryUnknown:
+			unknown = true
+		}
+	}
+	if unknown {
+		return groupUnknown
+	}
+	if probeErr == nil && zombies == 0 {
+		// The kernel says the group still has members but the scan found
+		// none, live or dead: some are not visible to us.
+		return groupUnknown
+	}
+	return groupGone
+}
+
+// procEntryClass is what one /proc entry says about a process group.
+type procEntryClass int
+
+const (
+	// entryOther: not a member of the group (or not a process entry, or it
+	// exited while being read).
+	entryOther procEntryClass = iota
+	entryLive
+	entryZombie
+	// entryUnknown: the entry could not be read or parsed.
+	entryUnknown
+)
+
+// classifyProcEntry classifies /proc/<name>/stat against process group want.
+func classifyProcEntry(proc fs.FS, name, want string) procEntryClass {
+	if name == "" || name[0] < '0' || name[0] > '9' {
+		return entryOther
+	}
+	raw, err := fs.ReadFile(proc, name+"/stat")
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return entryOther // exited while scanning
+		}
+		return entryUnknown
+	}
+	state, pg, ok := parseProcStat(raw)
+	if !ok {
+		return entryUnknown
+	}
+	if pg != want {
+		return entryOther
+	}
+	if state == "Z" || state == "X" {
+		return entryZombie
+	}
+	return entryLive
+}
+
+// parseProcStat extracts the state and process group fields from a
+// /proc/<pid>/stat record: "pid (comm) state ppid pgrp ...", where comm may
+// contain spaces and parentheses, so the split is after the LAST ')'.
+func parseProcStat(raw []byte) (state, pgrp string, ok bool) {
+	i := strings.LastIndexByte(string(raw), ')')
+	if i < 0 || i+2 >= len(raw) {
+		return "", "", false
+	}
+	fields := strings.Fields(string(raw[i+2:]))
+	if len(fields) < 3 {
+		return "", "", false
+	}
+	return fields[0], fields[2], true
+}
+
+// groupHasLiveMembers reports whether any non-zombie process still belongs to
+// process group pgid. ok is false when that cannot be established.
+func groupHasLiveMembers(pgid int) (alive bool, ok bool) {
+	return liveMembersOf(inspectGroup(pgid, defaultInspector()))
+}
+
+// liveMembersOf maps an inspection result to (alive, ok). An unknown group is
+// reported as alive with ok false: it is never presented as gone.
+func liveMembersOf(state groupState) (alive bool, ok bool) {
+	switch state {
+	case groupLive:
+		return true, true
+	case groupGone:
+		return false, true
+	default:
+		return true, false
+	}
 }
 
 // parseExecParams pulls validated values out of the JSON params map.

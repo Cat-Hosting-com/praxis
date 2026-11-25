@@ -7,6 +7,8 @@ import { useLatestRequest } from '@/hooks/useLatestRequest';
 import {
   fetchAllUpdates,
   fetchSystemUpdates,
+  fetchAptMetadataFreshness,
+  AptMetadataFreshness,
   applyUpdates,
   scanPackages,
   fetchPackages,
@@ -24,6 +26,7 @@ import Link from 'next/link';
 import { usePackageScope } from '@/hooks/usePackageScope';
 import PackageScopeControl from '@/components/packages/PackageScopeControl';
 import CohortScanButton from '@/components/packages/CohortScanButton';
+import AptMetadataBanner from '@/components/packages/AptMetadataBanner';
 import { isScopeReady } from '@/services/packageScope';
 import { deriveLastChecked } from '@/utils/lastChecked';
 
@@ -44,6 +47,8 @@ interface ConfirmState {
   onConfirm: () => void;
 }
 
+const noop = () => undefined;
+
 const AvailableUpdates = () => {
   const formatTimestamp = useFormatTimestamp();
   const [systems, setSystems] = useState<SystemOption[]>([]);
@@ -61,6 +66,7 @@ const AvailableUpdates = () => {
         ? smartGroups.find((g) => g.id === scope.id)
         : null;
   const [updates, setUpdates] = useState<PackageUpdateItem[]>([]);
+  const [metadata, setMetadata] = useState<AptMetadataFreshness[]>([]);
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [updating, setUpdating] = useState(false);
@@ -72,7 +78,7 @@ const AvailableUpdates = () => {
   const [pageOffset, setPageOffset] = useState(0);
   const pageLimit = 25;
   const [confirm, setConfirm] = useState<ConfirmState>({
-    open: false, title: '', message: '', confirmLabel: 'Confirm', variant: 'danger', onConfirm: () => {},
+    open: false, title: '', message: '', confirmLabel: 'Confirm', variant: 'danger', onConfirm: noop,
   });
 
   const closeConfirm = () => setConfirm((prev) => ({ ...prev, open: false }));
@@ -117,6 +123,15 @@ const AvailableUpdates = () => {
           : await fetchAllUpdates(scope);
       if (!isCurrent()) return;
       setUpdates(data);
+      // Freshness is advisory context for the counts; a failure to load it must
+      // not hide the updates themselves.
+      fetchAptMetadataFreshness(scope)
+        .then((rows) => {
+          if (isCurrent()) setMetadata(rows);
+        })
+        .catch(() => {
+          if (isCurrent()) setMetadata([]);
+        });
     } catch (err) {
       if (!isCurrent()) return;
       toast.error(err instanceof Error ? err.message : 'Failed to load updates');
@@ -153,9 +168,15 @@ const AvailableUpdates = () => {
     try {
       const result = await scanPackages(selectedSystem);
       if (result.status === 'success') {
-        toast.success(
-          `Scan complete: ${result.packages_found} packages found, ${result.updates_available} updates available`
-        );
+        const unverified = result.scan_state === 'partial';
+        const summary = `${result.packages_found} packages found, ${result.updates_available} updates available`;
+        if (unverified) {
+          toast.warning(
+            `Scan finished with unverified update counts: ${summary}. ${result.message ?? ''}`.trim()
+          );
+        } else {
+          toast.success(`Scan complete: ${summary}`);
+        }
         // PRA-348: reflect the new scan time on the matching system so the derived
         // "Last checked" updates immediately (and stays consistent with a reload).
         setSystems((prev) =>
@@ -175,6 +196,11 @@ const AvailableUpdates = () => {
       setScanning(false);
     }
   };
+
+  const getSystemHostname = useCallback((systemId: number) => {
+    const sys = systems.find((s) => s.id === systemId);
+    return sys ? sys.hostname : String(systemId);
+  }, [systems]);
 
   const reportRebootStatus = (result: ApplyUpdatesResult) => {
     notifyRebootStatus(result, toast);
@@ -255,20 +281,15 @@ const AvailableUpdates = () => {
     });
   };
 
-  const getSystemHostname = useCallback((systemId: number) => {
-    const sys = systems.find((s) => s.id === systemId);
-    return sys ? sys.hostname : String(systemId);
-  }, [systems]);
-
   const filteredUpdates = useMemo(() => {
     let result = updates;
     if (search.trim()) {
-      const q = search.toLowerCase();
+      const query = search.toLowerCase();
       result = result.filter(
         (u) =>
-          u.package_name.toLowerCase().includes(q) ||
-          getSystemHostname(u.system_id).toLowerCase().includes(q) ||
-          u.update_type.toLowerCase().includes(q)
+          u.package_name.toLowerCase().includes(query) ||
+          getSystemHostname(u.system_id).toLowerCase().includes(query) ||
+          u.update_type.toLowerCase().includes(query)
       );
     }
     result = [...result].sort((a, b) => {
@@ -290,6 +311,8 @@ const AvailableUpdates = () => {
           break;
         case 'discovered_on':
           cmp = (a.discovered_on || '').localeCompare(b.discovered_on || '');
+          break;
+        default:
           break;
       }
       return sortDir === 'asc' ? cmp : -cmp;
@@ -326,6 +349,7 @@ const AvailableUpdates = () => {
       <PageHeader title="Available Updates" actions={<HelpLink slug="packages" />} />
       <Card>
         <CardBody>
+          <AptMetadataBanner rows={metadata} formatTimestamp={formatTimestamp} />
           <div className="mb-6">
             <div className="flex flex-wrap justify-between items-end gap-3">
               <PackageScopeControl

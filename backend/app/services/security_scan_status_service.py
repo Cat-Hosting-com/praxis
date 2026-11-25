@@ -29,14 +29,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import false, func
 from sqlalchemy.orm import Session
 
 from ..core.redaction import redact_text
-from ..db.models import FleetOperation, FleetOperationResult, System
+from ..db.models import Distro, FleetOperation, FleetOperationResult, System
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,39 @@ STATE_SCANNING = "scanning"
 STATE_FAILED = "failed"
 STATE_PARTIAL = "partial"
 STATE_COMPLETE = "complete"
+
+# APT metadata observation states that do not vouch for candidate versions.
+UNVERIFIED_METADATA_STATES = ("partial", "failed", "cached")
+APT_METADATA_FRESH = "fresh"
+
+# Distribution names whose package manager is APT. The package service derives
+# its distro-to-manager map from this tuple so the two cannot disagree.
+APT_DISTRO_KEYS = ("ubuntu", "debian")
+
+
+def is_apt_distro(name: Optional[str]) -> bool:
+    lowered = (name or "").lower()
+    return any(key in lowered for key in APT_DISTRO_KEYS)
+
+
+def _security_success_is_vouched_for(
+    outcome: FleetOperationResult,
+    metadata_state: Optional[str],
+    refreshed_at: Optional[datetime],
+) -> bool:
+    """An APT host's security success counts only against verified metadata.
+
+    The scan must have run against a verified refresh, the host's latest APT
+    check must still be verified, and no later refresh may sit between that
+    scan and now: a refresh newer than the scan changed the metadata under its
+    counts, so only a security scan of its own certifies them again. A host that
+    never recorded a freshness observation, such as one migrated with a legacy
+    scan history, has no verified evidence and is not vouched for.
+    """
+    if metadata_state != APT_METADATA_FRESH or refreshed_at is None:
+        return False
+    return outcome.created_at is not None and outcome.created_at >= refreshed_at
+
 
 # A scan runs inside the request that started it, so an operation still marked
 # running long afterwards belongs to a process that died mid-scan. Treat those
@@ -290,6 +324,62 @@ def _coverage_detail(state: str, counts: Dict[str, int]) -> str:
     )
 
 
+def _outcome_bucket(
+    system_id: int,
+    outcome: Any,
+    apt_hosts: Dict[int, Tuple[Optional[str], Optional[datetime]]],
+) -> str:
+    """Coverage bucket for a host's latest recorded scan outcome.
+
+    ``never_scanned`` when no outcome exists. A success on an APT host counts as
+    ``scanned`` only when the host's recorded metadata check vouches for it;
+    otherwise it is ``partial``.
+    """
+    if outcome is None:
+        return "never_scanned"
+    if outcome.status == RESULT_SUCCESS:
+        if system_id in apt_hosts and not _security_success_is_vouched_for(
+            outcome, *apt_hosts[system_id]
+        ):
+            return "partial"
+        return "scanned"
+    if outcome.status == RESULT_PARTIAL:
+        return "partial"
+    return "failed"
+
+
+def _coverage_state(
+    in_scope: Set[int], scanning_ids: Set[int], scanned: int, partial: int, failed: int
+) -> str:
+    """Overall coverage state from the per-host bucket counts."""
+    if not in_scope:
+        return STATE_NOT_SCANNED
+    if scanning_ids:
+        return STATE_SCANNING
+    if scanned == len(in_scope):
+        return STATE_COMPLETE
+    if scanned == 0 and partial == 0:
+        return STATE_FAILED if failed else STATE_NOT_SCANNED
+    return STATE_PARTIAL
+
+
+def _metadata_unverified_count(db: Session, in_scope: Set[int]) -> int:
+    """In-scope hosts whose latest APT check was cached, partial, or failed.
+
+    A host that has never recorded a check is unknown, not unverified.
+    """
+    if not in_scope:
+        return 0
+    return (
+        db.query(System)
+        .filter(
+            System.id.in_(in_scope),
+            System.apt_metadata_state.in_(UNVERIFIED_METADATA_STATES),
+        )
+        .count()
+    )
+
+
 def get_security_scan_coverage(
     db: Session,
     system_ids: Optional[Set[int]] = None,
@@ -303,30 +393,33 @@ def get_security_scan_coverage(
     """
     now = now or datetime.utcnow()
 
-    in_scope = {
-        row[0]
-        for row in _scope(
-            db.query(System.id).filter(System.status != DECOMMISSIONED_STATUS),
+    scope_rows = _scope(
+        db.query(
             System.id,
-            system_ids,
-        ).all()
+            Distro.name,
+            System.apt_metadata_state,
+            System.apt_metadata_refreshed_at,
+        )
+        .join(Distro, Distro.id == System.distro_id)
+        .filter(System.status != DECOMMISSIONED_STATUS),
+        System.id,
+        system_ids,
+    ).all()
+    in_scope = {row[0] for row in scope_rows}
+    apt_hosts = {
+        row[0]: (row[2], row[3]) for row in scope_rows if is_apt_distro(row[1])
     }
     outcomes = _latest_outcomes(db, system_ids)
     scanning_ids = _scanning_system_ids(db, system_ids, now) & in_scope
 
-    scanned = partial = failed = never_scanned = 0
-    for system_id in in_scope:
-        if system_id in scanning_ids:
-            continue
-        outcome = outcomes.get(system_id)
-        if outcome is None:
-            never_scanned += 1
-        elif outcome.status == RESULT_SUCCESS:
-            scanned += 1
-        elif outcome.status == RESULT_PARTIAL:
-            partial += 1
-        else:
-            failed += 1
+    buckets = Counter(
+        _outcome_bucket(system_id, outcomes.get(system_id), apt_hosts)
+        for system_id in in_scope
+        if system_id not in scanning_ids
+    )
+    scanned = buckets["scanned"]
+    partial = buckets["partial"]
+    failed = buckets["failed"]
 
     counts = {
         "systems_total": len(in_scope),
@@ -334,19 +427,10 @@ def get_security_scan_coverage(
         "systems_partial": partial,
         "systems_failed": failed,
         "systems_scanning": len(scanning_ids),
-        "systems_never_scanned": never_scanned,
+        "systems_never_scanned": buckets["never_scanned"],
     }
-
-    if not in_scope:
-        state = STATE_NOT_SCANNED
-    elif scanning_ids:
-        state = STATE_SCANNING
-    elif scanned == len(in_scope):
-        state = STATE_COMPLETE
-    elif scanned == 0 and partial == 0:
-        state = STATE_FAILED if failed else STATE_NOT_SCANNED
-    else:
-        state = STATE_PARTIAL
+    state = _coverage_state(in_scope, scanning_ids, scanned, partial, failed)
+    metadata_unverified = _metadata_unverified_count(db, in_scope)
 
     coverage_complete = bool(in_scope) and scanned == len(in_scope)
     return {
@@ -354,6 +438,7 @@ def get_security_scan_coverage(
         "coverage_complete": coverage_complete,
         "counts_trustworthy": state == STATE_COMPLETE,
         **counts,
+        "systems_metadata_unverified": metadata_unverified,
         "last_successful_scan_at": _iso(
             _last_outcome_time(db, system_ids, (RESULT_SUCCESS,))
         ),

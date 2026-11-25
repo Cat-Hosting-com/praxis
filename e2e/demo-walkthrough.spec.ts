@@ -1,15 +1,11 @@
 /**
  * PRA-184: 1.0 demo walkthrough — deterministic proof path + screenshots.
  *
- * Assumes the synthetic demo fixture has been seeded first:
+ * Reads the synthetic demo fleet seeded by e2e/fixtures/seed-demo.sh; the
+ * "fixtures" project verifies it first and names the command when it is
+ * missing (see e2e/README.md).
  *
- *   docker compose exec -T backend python -m app.scripts.update_eol_data
- *   docker compose exec -T backend python -m app.scripts.seed_demo_fixture
- *
- * Then run against the running prod-parity stack via Caddy (E2E_BASE_URL,
- * default https://localhost — bring it up with `--profile bundled --profile proxy`):
- *
- *   npx playwright test e2e/demo-walkthrough.spec.ts
+ *   npx playwright test --project=chromium-fixtures demo-walkthrough
  *
  * Auth state is pre-loaded from auth.setup.ts (chromium project storageState).
  * Screenshots land under the ignored test-results/demo-walkthrough/ directory;
@@ -21,7 +17,7 @@
 import { test, expect } from "@playwright/test";
 
 const SHOTS = "test-results/demo-walkthrough";
-const T = 15_000;
+const TIMEOUT_MS = 15_000;
 
 // Demo fixture identifiers (see backend/app/scripts/seed_demo_fixture.py).
 const DEMO_HOSTS = ["demo-web-01", "demo-db-01", "demo-edge-01"];
@@ -35,11 +31,11 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: /Dashboard/i }).first(),
-    ).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
     // The Distro Lifecycle card + its buckets are the PRA-240 surface; with the
     // demo fixture seeded the hosts are supported (not an unexplained unknown).
     await expect(page.getByText("Distro Lifecycle").first()).toBeVisible({
-      timeout: T,
+      timeout: TIMEOUT_MS,
     });
     await expect(page.getByText("Supported", { exact: true }).first()).toBeVisible();
     await page.screenshot({ path: `${SHOTS}/01-fleet-dashboard.png`, fullPage: true });
@@ -50,10 +46,10 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: "All Systems" }).first(),
-    ).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
     for (const host of DEMO_HOSTS) {
       await expect(page.getByText(host, { exact: true }).first()).toBeVisible({
-        timeout: T,
+        timeout: TIMEOUT_MS,
       });
     }
     await page.screenshot({ path: `${SHOTS}/02-all-systems.png`, fullPage: true });
@@ -64,8 +60,8 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: /Content profiles/i }).first(),
-    ).toBeVisible({ timeout: T });
-    await expect(page.getByText(DEMO_PROFILE).first()).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
+    await expect(page.getByText(DEMO_PROFILE).first()).toBeVisible({ timeout: TIMEOUT_MS });
     await page.screenshot({ path: `${SHOTS}/03-content-profiles.png`, fullPage: true });
   });
 
@@ -74,8 +70,8 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: /Patch policies/i }).first(),
-    ).toBeVisible({ timeout: T });
-    await expect(page.getByText(DEMO_POLICY).first()).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
+    await expect(page.getByText(DEMO_POLICY).first()).toBeVisible({ timeout: TIMEOUT_MS });
     await page.screenshot({ path: `${SHOTS}/04-patch-policies.png`, fullPage: true });
   });
 
@@ -86,19 +82,19 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: /Patch Update Plans/i }).first(),
-    ).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
     const planLink = page.getByText(DEMO_PLAN).first();
-    await expect(planLink).toBeVisible({ timeout: T });
+    await expect(planLink).toBeVisible({ timeout: TIMEOUT_MS });
     await page.screenshot({ path: `${SHOTS}/05-patch-update-plans.png`, fullPage: true });
 
     // Open the plan detail (approval / execution / reboot / rollback surfaces).
     await planLink.click();
-    await page.waitForURL(/\/patch-update-plans\/\d+/, { timeout: T });
+    await page.waitForURL(/\/patch-update-plans\/\d+/, { timeout: TIMEOUT_MS });
     await page.waitForLoadState("networkidle");
-    await expect(page.getByText(DEMO_PLAN).first()).toBeVisible({ timeout: T });
+    await expect(page.getByText(DEMO_PLAN).first()).toBeVisible({ timeout: TIMEOUT_MS });
     // Rollback is a stable panel heading on the plan detail; reaching it proves
     // the reboot/rollback surfaces are present for the walkthrough.
-    await expect(page.getByText(/Rollback/i).first()).toBeVisible({ timeout: T });
+    await expect(page.getByText(/Rollback/i).first()).toBeVisible({ timeout: TIMEOUT_MS });
     await page.screenshot({ path: `${SHOTS}/06-plan-detail.png`, fullPage: true });
   });
 
@@ -107,7 +103,7 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: /Compliance Dashboard/i }).first(),
-    ).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
     await page.screenshot({ path: `${SHOTS}/07-compliance.png`, fullPage: true });
   });
 
@@ -116,7 +112,7 @@ test.describe("1.0 demo walkthrough", () => {
     await page.waitForLoadState("networkidle");
     await expect(
       page.getByRole("heading", { name: /Remediation/i }).first(),
-    ).toBeVisible({ timeout: T });
+    ).toBeVisible({ timeout: TIMEOUT_MS });
     await page.screenshot({ path: `${SHOTS}/08-remediation.png`, fullPage: true });
   });
 });
